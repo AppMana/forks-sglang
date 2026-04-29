@@ -51,24 +51,31 @@ assert_shape(s, (bs, seq, dim // block_size), "s (scales)")
 assert y.dtype == torch.float8_e4m3fn, f"y dtype {y.dtype}"
 assert s.dtype == torch.float32, f"s dtype {s.dtype}"
 
-# ----- 2. fp8_index_kernel: V4 indexer GEMM on Ampere ---------------------
-heading("fp8_index_kernel (V4 indexer FP8 q @ FP8 k -> FP32 score)")
-from sglang.srt.layers.attention.nsa.tilelang_kernel import fp8_index_kernel
-from sglang.srt.layers.attention.nsa.tilelang_kernel import FP8 as FP8_, FP32
+# ----- 2. fp8_index: dispatcher picks Ampere BF16 path on sm_86 -----------
+heading("fp8_index (dispatcher: Ampere BF16 fallback for sm<89)")
+from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+    fp8_index,
+    _device_has_fp8_mma,
+)
 
-# Per kernel signature (line 124): q[b, m, h, d] FP8, q_s[b, m, h] FP32,
-# k[b, n, d] FP8, k_s[b, n] FP32 -> o[b, m, n] FP32. Build directly.
+# Same shapes the V4 indexer uses: q[b, m, h, d] FP8, q_s[b, m, h] FP32,
+# k[b, n, d] FP8, k_s[b, n] FP32 -> o[b, m, n] FP32. Build directly so the
+# scales align with the kernel's expected shape.
 B, M, H, D, N = 1, 16, 64, 128, 32
 q = torch.randn(B, M, H, D, device=DEVICE).to(torch.float8_e4m3fn)
 q_s = torch.rand(B, M, H, device=DEVICE, dtype=torch.float32)
 k = torch.randn(B, N, D, device=DEVICE).to(torch.float8_e4m3fn)
 k_s = torch.rand(B, N, device=DEVICE, dtype=torch.float32)
+print(f"  device_has_fp8_mma={_device_has_fp8_mma()} (sm_{DEV_CC[0]}.{DEV_CC[1]})")
 print(f"  q {tuple(q.shape)} q_s {tuple(q_s.shape)} k {tuple(k.shape)} k_s {tuple(k_s.shape)}")
-score = fp8_index_kernel(H, D)(q, q_s, k, k_s)
+score = fp8_index(q, q_s, k, k_s)
+torch.cuda.synchronize()
 assert_shape(score, (B, M, N), "score")
 assert score.dtype == torch.float32, f"score dtype {score.dtype}"
 assert torch.isfinite(score).all(), "score has nan/inf"
-print("  fp8_index_kernel JIT-compiled and executed on sm_86 OK")
+# Sanity: ReLU -> non-negative, scaled by q_s and k_s -> non-negative
+assert (score >= 0).all(), "score should be non-negative (ReLU * positive scales)"
+print("  fp8_index dispatcher OK on sm_86")
 
 # ----- 3. NSA backend selector accepts tilelang for both prefill+decode ----
 heading("ServerArgs accepts --nsa-prefill-backend tilelang --nsa-decode-backend tilelang")

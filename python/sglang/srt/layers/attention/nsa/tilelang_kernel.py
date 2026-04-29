@@ -178,6 +178,110 @@ def fp8_index_kernel(h: int, d: int, clear_accum=True):
     return fp8_index_kernel_
 
 
+@tilelang.jit(out_idx=[4], pass_configs=pass_configs)
+def fp8_index_kernel_bf16(h: int, d: int, clear_accum=True):
+    """sm_86-compatible variant: dequant FP8 q/k to BF16 inline so T.gemm
+    emits Ampere-native BF16 MMAs instead of sm_89 FP8 MMAs.
+
+    sm_86 (RTX 3090, A5000, A100) has no native FP8 tensor cores. The
+    SM89_16x8x32_F32E4M3E4M3F32_TN MMA used by the FP8 path triggers a
+    device-side assertion at runtime. Dequantizing FP8->BF16 in shared
+    memory and using T.gemm on BF16 picks SM80_16x8x16_F32F16F16F32_TN,
+    which works on every Ampere card. Memory bandwidth doubles, but the
+    indexer GEMM is small (M~16, N up to a few k, D=128) so this is fine.
+
+    Same input/output contract as fp8_index_kernel."""
+    b = T.symbolic("b")
+    m = T.symbolic("m")
+    n = T.symbolic("n")
+
+    blk_n1 = 512
+    blk_n2 = 128
+
+    @T.prim_func
+    def fp8_index_kernel_bf16_(
+        q: T.Tensor[(b, m, h, d), FP8],
+        q_s: T.Tensor[(b, m, h), FP32],
+        k: T.Tensor[(b, n, d), FP8],
+        k_s: T.Tensor[(b, n), FP32],
+        o: T.Tensor[(b, m, n), FP32],
+    ) -> None:
+        with T.Kernel(b, m, T.ceildiv(n, blk_n1)) as (i_b, i_m, i1_n):
+            q_smem_fp8 = T.alloc_shared((h, d), FP8)
+            T.copy(q[i_b, i_m, 0, 0], q_smem_fp8)
+
+            q_smem = T.alloc_shared((h, d), BF16)
+            for i_h, i_d in T.Parallel(h, d):
+                q_smem[i_h, i_d] = T.cast(q_smem_fp8[i_h, i_d], BF16)
+
+            q_s_frag = T.alloc_fragment(h, FP32)
+            T.copy(q_s[i_b, i_m, 0], q_s_frag)
+
+            for i2_n in T.Pipelined(blk_n1 // blk_n2, num_stages=2):
+                k_smem_fp8 = T.alloc_shared((blk_n2, d), FP8)
+                T.copy(k[i_b, i1_n * blk_n1 + i2_n * blk_n2, 0], k_smem_fp8)
+
+                k_smem = T.alloc_shared((blk_n2, d), BF16)
+                for i_n, i_d in T.Parallel(blk_n2, d):
+                    k_smem[i_n, i_d] = T.cast(k_smem_fp8[i_n, i_d], BF16)
+
+                k_s_frag = T.alloc_fragment(blk_n2, FP32)
+                T.copy(k_s[i_b, i1_n * blk_n1 + i2_n * blk_n2], k_s_frag)
+
+                logits = T.alloc_fragment((blk_n2, h), FP32)
+                if not clear_accum:
+                    T.fill(logits, 0)
+                T.gemm(
+                    k_smem,
+                    q_smem,
+                    logits,
+                    transpose_A=False,
+                    transpose_B=True,
+                    clear_accum=clear_accum,
+                )
+
+                for i_h, i3_n in T.Parallel(h, blk_n2):
+                    logits[i3_n, i_h] = T.max(logits[i3_n, i_h], 0) * q_s_frag[i_h]
+
+                logits_sum = T.alloc_fragment(blk_n2, FP32)
+                T.reduce_sum(logits, logits_sum, dim=1)
+
+                for i3_n in T.Parallel(blk_n2):
+                    logits_sum[i3_n] *= k_s_frag[i3_n]
+
+                T.copy(logits_sum, o[i_b, i_m, i1_n * blk_n1 + i2_n * blk_n2])
+
+    return fp8_index_kernel_bf16_
+
+
+# Module-level cache for the device's compute capability major. torch is
+# available because tilelang requires it; we only check at first call so
+# import-time cost is unchanged.
+_DEVICE_CC_MAJOR: Optional[int] = None
+_DEVICE_CC_MINOR: Optional[int] = None
+
+
+def _device_has_fp8_mma() -> bool:
+    """True when the current device has FP8 tensor cores (sm_89+ NVIDIA, or HIP).
+
+    sm_86 / sm_80 (Ampere) do NOT have FP8 TC; the SM89 PTX MMA traps at
+    runtime if invoked there. Pre-Ampere is irrelevant (sglang requires
+    sm_75+ in practice).
+    """
+    global _DEVICE_CC_MAJOR, _DEVICE_CC_MINOR
+    if _is_hip:
+        return True
+    if _DEVICE_CC_MAJOR is None:
+        cc_major, cc_minor = torch.cuda.get_device_capability()
+        _DEVICE_CC_MAJOR, _DEVICE_CC_MINOR = cc_major, cc_minor
+    # sm_89 (Ada), sm_90+ (Hopper, Blackwell) have native FP8 tensor cores.
+    if _DEVICE_CC_MAJOR >= 9:
+        return True
+    if _DEVICE_CC_MAJOR == 8 and _DEVICE_CC_MINOR >= 9:
+        return True
+    return False
+
+
 def fp8_index(
     q: torch.Tensor,
     q_s: torch.Tensor,
@@ -200,8 +304,11 @@ def fp8_index(
     """
     if _is_hip:
         return fp8_index_kernel(q.shape[2], q.shape[3], False)(q, q_s, k, k_s)
-    else:
+    if _device_has_fp8_mma():
         return fp8_index_kernel(q.shape[2], q.shape[3])(q, q_s, k, k_s)
+    # sm_86 / sm_80 fallback: dequant FP8->BF16 inside the kernel and use
+    # the Ampere BF16 tensor cores. See fp8_index_kernel_bf16 docstring.
+    return fp8_index_kernel_bf16(q.shape[2], q.shape[3])(q, q_s, k, k_s)
 
 
 @tilelang.jit(

@@ -1138,6 +1138,22 @@ class ServerArgs:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
+        # NVIDIA pre-Hopper (sm < 9, i.e. Ampere/Ada) has no flashmla / fa3
+        # builds, and its FP8 tensor cores only exist on sm_89 (Ada). The
+        # tilelang NSA backend works on every Ampere card via the BF16
+        # fallback in fp8_index (see tilelang_kernel.fp8_index_kernel_bf16).
+        # Default to it unless the user overrides.
+        if major < 9 and not is_hip():
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "tilelang"
+            if not user_set_decode:
+                self.nsa_decode_backend = "tilelang"
+            logger.warning(
+                f"Set NSA backends for {self.kv_cache_dtype} KV Cache on SM{major} (pre-Hopper NVIDIA): "
+                f"prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
+            )
+            return
+
         if kv_cache_dtype == "fp8_e4m3":
             # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
             if not user_set_prefill:
