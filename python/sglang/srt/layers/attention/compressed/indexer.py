@@ -372,7 +372,15 @@ class C4IndexerBackend:
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+        # On sm<9 NVIDIA, deep_gemm.fp8_paged_mqa_logits raises 'Unsupported
+        # architecture' at runtime (no FP8 tensor cores). Auto-pick the
+        # tilelang implementation we patched with a BF16 fallback. Users can
+        # still force a different path with SGLANG_OPT_USE_TILELANG_INDEXER /
+        # SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.
+        from sglang.srt.layers.attention.nsa.nsa_indexer import (
+            _deep_gemm_supports_fp8_attn,
+        )
+        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() or not _deep_gemm_supports_fp8_attn():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
