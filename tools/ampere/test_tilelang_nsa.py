@@ -101,6 +101,37 @@ assert_shape(o, (N_b, S2), "o (logits)")
 assert (o[:, : seq_lens.item()] >= 0).all(), "logits should be non-negative for processed blocks"
 print("  fp8_paged_mqa_logits_kernel_bf16 JIT-compiled and executed on sm_86 OK")
 
+# ----- 2c. nsa_indexer dispatcher: deep_gemm -> tilelang on sm<9 ----------
+heading("nsa_indexer._fp8_mqa_logits_dispatch (deep_gemm -> tilelang fallback)")
+from sglang.srt.layers.attention.nsa.nsa_indexer import (
+    _fp8_mqa_logits_dispatch,
+    _deep_gemm_supports_fp8_attn,
+)
+
+print(f"  _deep_gemm_supports_fp8_attn={_deep_gemm_supports_fp8_attn()} (expected False on sm_8.6)")
+N3, H3, D3, T3 = 8, 64, 128, 64
+q_mqa = torch.randn(N3, H3, D3, device=DEVICE).to(torch.float8_e4m3fn).contiguous()
+k_mqa = torch.randn(T3, D3, device=DEVICE).to(torch.float8_e4m3fn).contiguous()
+k_scale_mqa = torch.rand(T3, device=DEVICE, dtype=torch.float32).contiguous()
+weights_mqa = torch.rand(N3, H3, device=DEVICE, dtype=torch.float32)
+# ks/ke per-token: [0, t1), [t0, t2), ..., increasing windows
+ks_mqa = torch.zeros(N3, device=DEVICE, dtype=torch.int32)
+ke_mqa = torch.tensor([t for t in range(T3 // N3, T3 + 1, T3 // N3)], device=DEVICE, dtype=torch.int32)[:N3]
+print(f"  q {tuple(q_mqa.shape)} k {tuple(k_mqa.shape)} ks={ks_mqa.tolist()[:4]}... ke={ke_mqa.tolist()[:4]}...")
+logits_mqa = _fp8_mqa_logits_dispatch(q_mqa, (k_mqa, k_scale_mqa), weights_mqa, ks_mqa, ke_mqa)
+torch.cuda.synchronize()
+assert_shape(logits_mqa, (N3, T3), "logits")
+# Positions outside [ks, ke) should be -inf (mask), inside should be finite
+for n in range(N3):
+    inside_mask = torch.zeros(T3, dtype=torch.bool, device=DEVICE)
+    inside_mask[ks_mqa[n].item():ke_mqa[n].item()] = True
+    inside = logits_mqa[n][inside_mask]
+    outside = logits_mqa[n][~inside_mask]
+    assert torch.isfinite(inside).all(), f"row {n} has non-finite logits inside ks/ke"
+    if outside.numel():
+        assert (outside == float("-inf")).all(), f"row {n} has non-(-inf) logits outside ks/ke"
+print("  _fp8_mqa_logits_dispatch routes to tilelang fp8_index correctly on sm_86 OK")
+
 # ----- 3. NSA backend selector accepts tilelang for both prefill+decode ----
 heading("ServerArgs accepts --nsa-prefill-backend tilelang --nsa-decode-backend tilelang")
 from sglang.srt.server_args import ServerArgs

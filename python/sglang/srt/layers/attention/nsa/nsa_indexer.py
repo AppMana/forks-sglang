@@ -80,6 +80,49 @@ def _fp8_paged_mqa_logits_dispatch(
         clean_logits=False,
     )
 
+
+def _fp8_mqa_logits_dispatch(
+    q_fp8: torch.Tensor,
+    kv_fp8: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    clean_logits: bool = False,
+):
+    """deep_gemm.fp8_mqa_logits with TileLang fp8_index fallback for sm<9.
+
+    Original deep_gemm signature: q_fp8 [N, H, D] FP8, kv_fp8 = (k_fp8 [T, D]
+    FP8, k_scale [T] FP32), weights [N, H] FP32, ks/ke [N] int32 -> [N, T]
+    FP32 logits with positions outside [ks[n], ke[n]) masked to -inf.
+
+    On sm<9 we route through tilelang fp8_index which does the same FP8
+    GEMM (with our BF16-fallback compile path) and apply the ks/ke mask
+    in PyTorch on the dense logits tensor.
+    """
+    if _deep_gemm_supports_fp8_attn():
+        return deep_gemm.fp8_mqa_logits(
+            q_fp8, kv_fp8, weights, ks, ke, clean_logits=clean_logits,
+        )
+    from sglang.srt.layers.attention.nsa.tilelang_kernel import fp8_index
+
+    k_fp8, k_scale = kv_fp8
+    # fp8_index wants [B, M, H, D] q, [B, M, H] q_s, [B, T, D] k, [B, T] k_s.
+    # We use B=1 and unsqueeze.
+    q4 = q_fp8.unsqueeze(0).contiguous()  # [1, N, H, D]
+    w3 = weights.unsqueeze(0).contiguous()  # [1, N, H]
+    k3 = k_fp8.unsqueeze(0).contiguous()  # [1, T, D]
+    ks3 = k_scale.unsqueeze(0).contiguous()  # [1, T]
+
+    score = fp8_index(q4, w3, k3, ks3)  # [1, N, T] FP32
+    score = score.squeeze(0)  # [N, T]
+
+    # Apply ks/ke mask: positions outside [ks[n], ke[n]) become -inf.
+    N, T = score.shape
+    pos = torch.arange(T, device=score.device, dtype=ks.dtype).unsqueeze(0)  # [1, T]
+    valid = (pos >= ks.unsqueeze(1)) & (pos < ke.unsqueeze(1))  # [N, T]
+    score = score.masked_fill(~valid, float("-inf"))
+    return score
+
 if _is_npu:
     import custom_ops  # noqa: F401
     import torch_npu
@@ -594,7 +637,7 @@ class Indexer(MultiPlatformOp):
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
                 else:
-                    logits = deep_gemm.fp8_mqa_logits(
+                    logits = _fp8_mqa_logits_dispatch(
                         q_fp8[:q_offset],
                         kv_fp8,
                         weights[:q_offset],
@@ -644,7 +687,7 @@ class Indexer(MultiPlatformOp):
                         ke[start:end],
                     )
                 else:
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                    logits_chunk = _fp8_mqa_logits_dispatch(
                         q_fp8[start:end],
                         kv_fp8,
                         weights[start:end],
@@ -808,7 +851,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = _fp8_mqa_logits_dispatch(
                     q_fp8,
                     kv_fp8,
                     weights,
@@ -854,7 +897,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = _fp8_mqa_logits_dispatch(
                     q_fp8,
                     kv_fp8,
                     weights,
