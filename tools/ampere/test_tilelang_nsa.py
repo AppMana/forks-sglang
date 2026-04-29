@@ -77,6 +77,30 @@ assert torch.isfinite(score).all(), "score has nan/inf"
 assert (score >= 0).all(), "score should be non-negative (ReLU * positive scales)"
 print("  fp8_index dispatcher OK on sm_86")
 
+# ----- 2b. fp8_paged_mqa_logits_kernel_bf16: paged MQA logits on Ampere ---
+heading("fp8_paged_mqa_logits_kernel_bf16 (paged MQA logits, FP8 q/cache)")
+from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+    fp8_paged_mqa_logits_kernel_bf16,
+)
+
+# Signature: q[N, H, D] FP8, kvcache[C, B, D] FP8 (strided), kvcache_scale[C, B] FP32,
+# weight[N, H] FP32, seq_lens[N] INT32, page_table[N, L] INT32 -> o[N, S] FP32.
+N_b, H2, D2, B2, C2, L2, S2 = 1, 64, 128, 64, 4, 4, 256
+q2 = torch.randn(N_b, H2, D2, device=DEVICE).to(torch.float8_e4m3fn)
+kvcache = torch.randn(C2, B2, D2, device=DEVICE).to(torch.float8_e4m3fn).contiguous()
+kvcache_scale = torch.rand(C2, B2, device=DEVICE, dtype=torch.float32).contiguous()
+weight = torch.rand(N_b, H2, device=DEVICE, dtype=torch.float32)
+seq_lens = torch.tensor([B2 * 2], device=DEVICE, dtype=torch.int32)  # 2 blocks
+page_table = torch.arange(L2, device=DEVICE, dtype=torch.int32).repeat(N_b, 1)
+o = torch.empty(N_b, S2, device=DEVICE, dtype=torch.float32)
+print(f"  q {tuple(q2.shape)} kvcache {tuple(kvcache.shape)} weight {tuple(weight.shape)}")
+kernel = fp8_paged_mqa_logits_kernel_bf16(head_dim=D2, num_heads=H2, block_size=B2, clear_accum=True)
+kernel(q2, kvcache, kvcache_scale, weight, seq_lens, page_table, o)
+torch.cuda.synchronize()
+assert_shape(o, (N_b, S2), "o (logits)")
+assert (o[:, : seq_lens.item()] >= 0).all(), "logits should be non-negative for processed blocks"
+print("  fp8_paged_mqa_logits_kernel_bf16 JIT-compiled and executed on sm_86 OK")
+
 # ----- 3. NSA backend selector accepts tilelang for both prefill+decode ----
 heading("ServerArgs accepts --nsa-prefill-backend tilelang --nsa-decode-backend tilelang")
 from sglang.srt.server_args import ServerArgs

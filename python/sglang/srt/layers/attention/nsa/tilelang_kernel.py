@@ -968,6 +968,85 @@ def fp8_paged_mqa_logits_kernel(
     return fp8_paged_mqa_logits
 
 
+@functools.cache
+def fp8_paged_mqa_logits_kernel_bf16(
+    head_dim: int = 128,
+    num_heads: int = 64,
+    block_size: int = 64,
+    clear_accum: bool = True,
+) -> Any:
+    """sm_86-compatible variant: dequant FP8 q/k cache to BF16 inline so
+    T.gemm picks SM80 BF16 MMAs instead of SM89 FP8 MMAs. See
+    fp8_index_kernel_bf16 for rationale."""
+    N = T.symbolic("batch_size")
+    L = T.symbolic("max_table_length")
+    S = T.symbolic("max_seq_len")
+    C = T.symbolic("num_blocks")
+    B = block_size
+    D = head_dim
+    H = num_heads
+    d_0, d_1 = T.dynamic("d_0, d_1")
+
+    assert D % 4 == 0
+    assert H % 4 == 0
+    assert D == 128
+
+    @tilelang.jit
+    def fp8_paged_mqa_logits_bf16(
+        q: T.Tensor[(N, H, D), FP8],
+        kvcache: T.StridedTensor[(C, B, D), (d_0, D, 1), FP8],
+        kvcache_scale: T.StridedTensor[(C, B), (d_1, 1), FP32],
+        weight: T.Tensor[(N, H), FP32],
+        seq_lens: T.Tensor[(N,), INT32],
+        page_table: T.Tensor[(N, L), INT32],
+        o: T.Tensor[(N, S), FP32],
+    ) -> None:
+        _ = N, L, S, C, D, H, B, d_0, d_1
+        with T.Kernel(N) as bx:
+            seq_len = seq_lens[bx]
+            q_smem_fp8 = T.alloc_shared((H, D), FP8)
+            T.copy(q[bx, 0, 0], q_smem_fp8)
+            q_smem = T.alloc_shared((H, D), BF16)
+            for h, d in T.Parallel(H, D):
+                q_smem[h, d] = T.cast(q_smem_fp8[h, d], BF16)
+
+            q_s_frag = T.alloc_fragment((H,), FP32)
+            T.copy(weight[bx, 0], q_s_frag)
+
+            for i in T.Pipelined(T.ceildiv(seq_len, B), num_stages=2):
+                page = page_table[bx, i]
+                k_smem_fp8 = T.alloc_shared((B, D), FP8)
+                T.copy(kvcache[page, 0, 0], k_smem_fp8)
+                k_smem = T.alloc_shared((B, D), BF16)
+                for j, d in T.Parallel(B, D):
+                    k_smem[j, d] = T.cast(k_smem_fp8[j, d], BF16)
+
+                k_s_frag = T.alloc_fragment((B,), FP32)
+                T.copy(kvcache_scale[page, 0], k_s_frag)
+
+                logits = T.alloc_fragment((B, H), FP32)
+                if not clear_accum:
+                    T.fill(logits, 0.0)
+                T.gemm(
+                    k_smem,
+                    q_smem,
+                    logits,
+                    transpose_A=False,
+                    transpose_B=True,
+                    clear_accum=clear_accum,
+                )
+
+                for h, j in T.Parallel(H, B):
+                    logits[j, h] = T.max(logits[j, h], 0.0) * q_s_frag[h]
+                logits_sum = T.alloc_fragment((B,), FP32)
+                T.reduce_sum(logits, logits_sum, dim=1)
+                for j in T.Parallel(B):
+                    logits_sum[j] *= k_s_frag[j]
+                T.copy(logits_sum, o[bx, i * B])
+
+    return fp8_paged_mqa_logits_bf16
+
+
 def tilelang_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -991,7 +1070,12 @@ def tilelang_fp8_paged_mqa_logits(
     assert clean_logits == False
 
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
-    kernel = fp8_paged_mqa_logits_kernel(
+    # Same dispatcher logic as fp8_index: route sm < 89 to BF16 fallback.
+    if _is_hip or _device_has_fp8_mma():
+        kernel_fn = fp8_paged_mqa_logits_kernel
+    else:
+        kernel_fn = fp8_paged_mqa_logits_kernel_bf16
+    kernel = kernel_fn(
         head_dim=head_dim,
         num_heads=num_heads,
         block_size=block_size,
