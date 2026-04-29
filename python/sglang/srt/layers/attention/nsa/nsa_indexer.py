@@ -31,6 +31,55 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
+# DeepGEMM's FP8 attention kernels require Hopper (sm 9+); on Ampere/Ada
+# (sm < 9) they raise `Unsupported architecture` at runtime. Detect device
+# capability once and dispatch to TileLang's BF16-fallback kernels for those
+# call sites. Initialised lazily to avoid touching CUDA at import time.
+_DG_HAS_FP8_ATTN: Optional[bool] = None
+
+
+def _deep_gemm_supports_fp8_attn() -> bool:
+    """True if deep_gemm's FP8 attention kernels (fp8_paged_mqa_logits,
+    fp8_mqa_logits) work on the current device. False for sm < 9 NVIDIA."""
+    global _DG_HAS_FP8_ATTN
+    if _DG_HAS_FP8_ATTN is not None:
+        return _DG_HAS_FP8_ATTN
+    if not _is_cuda:
+        _DG_HAS_FP8_ATTN = False
+        return False
+    cc_major, cc_minor = torch.cuda.get_device_capability()
+    if cc_major >= 9:
+        _DG_HAS_FP8_ATTN = True
+    elif cc_major == 8 and cc_minor >= 9:
+        _DG_HAS_FP8_ATTN = True  # Ada Lovelace has FP8 TC
+    else:
+        _DG_HAS_FP8_ATTN = False
+    return _DG_HAS_FP8_ATTN
+
+
+def _fp8_paged_mqa_logits_dispatch(
+    q_fp8, kv_cache_fp8, weights, seqlens, block_tables, schedule_metadata, max_seq_len,
+):
+    """deep_gemm.fp8_paged_mqa_logits with TileLang BF16 fallback for sm<9."""
+    if _deep_gemm_supports_fp8_attn():
+        return deep_gemm.fp8_paged_mqa_logits(
+            q_fp8, kv_cache_fp8, weights, seqlens, block_tables,
+            schedule_metadata, max_seq_len,
+        )
+    from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+        tilelang_fp8_paged_mqa_logits,
+    )
+    return tilelang_fp8_paged_mqa_logits(
+        q_fp8=q_fp8,
+        kvcache_fp8=kv_cache_fp8,
+        weight=weights,
+        seq_lens=seqlens,
+        page_table=block_tables,
+        deep_gemm_metadata=schedule_metadata,
+        max_seq_len=max_seq_len,
+        clean_logits=False,
+    )
+
 if _is_npu:
     import custom_ops  # noqa: F401
     import torch_npu
@@ -430,7 +479,7 @@ class Indexer(MultiPlatformOp):
                 WavePerEU=5,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
+            logits = _fp8_paged_mqa_logits_dispatch(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -438,7 +487,6 @@ class Indexer(MultiPlatformOp):
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
-                clean_logits=False,
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
