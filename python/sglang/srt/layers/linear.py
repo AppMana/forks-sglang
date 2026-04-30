@@ -66,6 +66,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
+    "Dsv4Int8LinearMethod",
 ]
 
 _is_cpu = is_cpu()
@@ -688,7 +689,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     "the same for all partitions."
                 )
 
-        assert param_data.shape == loaded_weight.shape
+        if param_data.shape != loaded_weight.shape:
+            raise AssertionError(
+                f"shape mismatch: param={getattr(param, '_name', '?')} "
+                f"param_data.shape={tuple(param_data.shape)} "
+                f"param_data.dtype={param_data.dtype} "
+                f"loaded_weight.shape={tuple(loaded_weight.shape)} "
+                f"loaded_weight.dtype={loaded_weight.dtype} "
+                f"loaded_shard_id={loaded_shard_id}"
+            )
         param_data.copy_(loaded_weight)
 
     def _load_fused_module_from_checkpoint(

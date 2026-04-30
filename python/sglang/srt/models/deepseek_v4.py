@@ -583,11 +583,16 @@ class MQALayer(nn.Module):
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             bias=False,
-            quant_config=quant_config if _FP8_WO_A_GEMM else None,
+            # Always pass quant_config so AOT-requantized INT8 checkpoints
+            # route wo_a through the runtime quant_method (Dsv4Int8LinearMethod
+            # dequants INT8 -> BF16 at load, then the BF16 einsum below works
+            # without changes). When the checkpoint is FP8 and
+            # _FP8_WO_A_GEMM=False, the upstream Fp8 quant_method silently
+            # converts to BF16 too.
+            quant_config=quant_config,
             prefix=add_prefix("wo_a", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            **({} if _FP8_WO_A_GEMM else {"params_dtype": torch.bfloat16}),
         )
         if _FP8_WO_A_GEMM:
             assert hasattr(
@@ -1504,7 +1509,17 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if _FP8_WO_A_GEMM:
+        # _setup_fp8_wo_a_scales transforms FP8 e8m0 scales into deep_gemm's
+        # required layout. Skip it when the AOT-requantized checkpoint stores
+        # wo_a as INT8 with BF16 scales (the Dsv4Int8LinearMethod path runs a
+        # torch BF16 GEMM and doesn't touch deep_gemm).
+        first_attn = self.model.layers[0].self_attn if self.model.layers else None
+        wo_a_is_fp8 = (
+            first_attn is not None
+            and getattr(first_attn.wo_a, "weight", None) is not None
+            and first_attn.wo_a.weight.dtype == torch.float8_e4m3fn
+        )
+        if _FP8_WO_A_GEMM and wo_a_is_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
@@ -2062,10 +2077,20 @@ def _dequant_fp8_wo_a(
         if not name.endswith(".wo_a.weight"):
             continue
         scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
-        assert scale_name in weights_dict
-        weight = weights_dict.pop(name)
+        if scale_name not in weights_dict:
+            continue
+        weight = weights_dict[name]
+        # Skip when the checkpoint has been AOT-requantized away from FP8
+        # (the new dtype is int8/int4 with bf16 scales). Pass through both
+        # weight and scale untouched -- the runtime quant_method handles them.
+        if weight.dtype != torch.float8_e4m3fn:
+            continue
+        weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)
         yield name, _dequant_fp8(weight, scale)
+    # Yield everything else (untouched).
+    for name, t in weights_dict.items():
+        yield name, t
 
     yield from weights_dict.items()
 
