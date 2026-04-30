@@ -41,6 +41,8 @@ def main():
         chunked_prefill_size=256,
         nsa_prefill_backend="tilelang",
         nsa_decode_backend="tilelang",
+        swa_full_tokens_ratio=0.5,
+        log_level="info",
     )
 
     print(f"[engine-test] engine ready, generating...", flush=True)

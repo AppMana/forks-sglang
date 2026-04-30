@@ -137,7 +137,7 @@ class ReqToTokenPool:
                 (size, max_context_len), dtype=torch.int32, device=device
             )
 
-        self.free_slots = list(range(1, size))
+        self.free_slots = list(range(size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -161,7 +161,7 @@ class ReqToTokenPool:
             self.free_slots.extend(free_index)
 
     def clear(self):
-        self.free_slots = list(range(1, self.size))
+        self.free_slots = list(range(self.size))
 
 
 class MambaPool:

@@ -429,12 +429,16 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
 
     def apply(self, layer, dispatch_output):
+        from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+            deepseek_v4_moe_code_path_checker,
+        )
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             fused_marlin_moe,
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
+        deepseek_v4_moe_code_path_checker.observed += 1
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights = topk_output.topk_weights
