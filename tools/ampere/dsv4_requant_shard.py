@@ -211,7 +211,10 @@ def _update_config(
     json.dump(cfg, open(dst_dir / "config.json", "w"), indent=2)
     _log(f"wrote {dst_dir / 'config.json'} with new quantization_config")
 
-    # Copy through the safetensors index, tokenizer, generation_config.
+    # Copy the safetensors index, tokenizer, and generation_config as real
+    # files (not symlinks) so the dst dir is a self-contained HF repo that can
+    # be uploaded with `huggingface-cli upload` or mounted into pods.
+    import shutil
     for fn in ("model.safetensors.index.json", "tokenizer.json",
                "tokenizer_config.json", "generation_config.json"):
         src_f = src_dir / fn
@@ -219,9 +222,7 @@ def _update_config(
             dst_f = dst_dir / fn
             if dst_f.exists() or dst_f.is_symlink():
                 dst_f.unlink()
-            # Preserve as symlink to avoid duplicating the tokenizer (16 MB).
-            real = src_f.resolve()
-            os.symlink(real, dst_f)
+            shutil.copy(src_f.resolve(), dst_f)
 
 
 def main() -> int:
