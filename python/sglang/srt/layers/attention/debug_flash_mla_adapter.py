@@ -3,13 +3,17 @@ Adapter for the V4 compressed-attention `flash_mla_with_kvcache` call.
 
 Backends:
   - "kernel"  : DeepSeek's flash_mla pip pkg (Hopper / sm_90+ only)
+  - "triton"  : portable Triton sparse-MLA kernels ported from vLLM PR #40899
+                (sm_8x and sm_12x; module: sparse_mla_triton/)
   - "torch"   : pure-pytorch FP32-accumulated sparse-MLA reference
-                (slow, but correct on any device that runs pytorch)
-  - "tilelang": (Phase B, not yet implemented) JIT TileLang kernel for sm_86
+                (correctness reference; very slow)
+  - "zero"    : zero-stub for plumbing bisection
+  - "tilelang": deprecated alias for "triton"
 
 Auto-pick:
   - device cap >= 9 + flash_mla importable -> "kernel"
-  - device cap <  9                        -> "torch" until tilelang lands
+  - device cap == 8 or 12                  -> "triton"
+  - otherwise                              -> "torch"
 
 The torch fallback produces correct output (within FP32 precision) for V4-Flash
 sparse-MLA on Ampere consumer GPUs (sm_86) where neither flash_mla nor a sparse
@@ -47,16 +51,24 @@ def _resolve_backend(requested: str) -> str:
     Translate the requested backend into the concrete one to run.
 
     "kernel"   -> use flash_mla pip pkg (errors if unavailable)
-    "torch"    -> torch fallback
-    "tilelang" -> TileLang kernel (Phase B; falls back to torch with warning)
-    "auto"     -> kernel on cap>=9, torch on cap<9
+    "triton"   -> portable Triton sparse-MLA kernels (sm_8x and sm_12x)
+    "torch"    -> torch fallback (correctness reference; very slow)
+    "tilelang" -> deprecated alias, redirects to "triton"
+    "zero"     -> zero-stub for plumbing bisection
+    "auto"     -> kernel on cap>=9; triton on cap 8 or 12; torch otherwise
     """
+    if requested == "tilelang":
+        return "triton"
     if requested == "auto":
         try:
             major, _ = torch.cuda.get_device_capability()
         except Exception:
             major = 0
-        return "kernel" if major >= 9 else "torch"
+        if major >= 9:
+            return "kernel"
+        if major in (8, 12):
+            return "triton"
+        return "torch"
     return requested
 
 
@@ -86,16 +98,12 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if backend == "torch":
         return _flash_mla_with_kvcache_torch_fallback(**kwargs)
 
-    if backend == "tilelang":
-        # Not yet implemented; degrade to torch so callers don't crash. Set
-        # SGLANG_HACK_FLASHMLA_BACKEND=torch explicitly to silence the warning.
-        import warnings
-        warnings.warn(
-            "tilelang backend not yet implemented for V4 sparse MLA; "
-            "falling back to torch reference.",
-            stacklevel=2,
+    if backend == "triton":
+        from sglang.srt.layers.attention.sparse_mla_triton import (
+            flash_mla_with_kvcache_triton,
         )
-        return _flash_mla_with_kvcache_torch_fallback(**kwargs)
+
+        return flash_mla_with_kvcache_triton(**kwargs)
 
     raise RuntimeError(f"unsupported flash_mla backend: {backend!r}")
 
