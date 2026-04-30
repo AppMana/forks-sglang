@@ -1,0 +1,21 @@
+# SGLang fork for Ampere (sm_86, RTX 3090/A5000) running DeepSeek-V4-Flash
+# with our AOT INT4/INT8 quantization. Base is the upstream lmsysorg/sglang
+# release matching our fork's branch base (v0.5.9..v0.5.10) — ABI-matched
+# sgl-kernel and pre-built FlashInfer/DeepEP wheels. We replace the Python
+# tree with our fork's `python/sglang` and reinstall in editable mode.
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.9
+FROM ${BASE_IMAGE}
+
+# V4-Flash needs tilelang for the NSA backends (sparse attention kernels).
+# Upstream :v0.5.9 image doesn't ship it.
+RUN pip install --break-system-packages tilelang==0.1.9
+
+COPY python/sglang /sgl-workspace/sglang/python/sglang
+
+RUN pip install --break-system-packages --no-deps -e /sgl-workspace/sglang/python
+
+ARG GIT_SHA=unknown
+ENV SGLANG_AMPERE_FORK_SHA=${GIT_SHA}
+LABEL appmana.com/sglang-fork=AppMana/forks-sglang \
+      appmana.com/sglang-fork-branch=deepseek_v4_ampere \
+      appmana.com/sglang-fork-sha=${GIT_SHA}
