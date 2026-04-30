@@ -540,6 +540,12 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # On sm<9 NVIDIA the V4 attention backend's flash_mla_with_kvcache call has
+    # no kernel implementation. Setting this returns zeros instead of the real
+    # MLA output -- the model still does the rest of forward (norm, MoE, head),
+    # so output is garbage but the path is exercised end-to-end. Smoke-test
+    # use only; replace with a real TileLang/torch sparse-MLA implementation.
+    SGLANG_DSV4_FLASHMLA_AMPERE_ZERO = EnvBool(False)
 
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)

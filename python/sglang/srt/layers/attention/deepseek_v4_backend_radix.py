@@ -116,6 +116,20 @@ def _copy_metadata(
 
 
 def _create_flashmla_metadata():
+    # On Ampere (sm<9), flash_mla is unavailable / unsupported. The metadata
+    # field is consumed only when a layer actually invokes flash_mla_with_kvcache;
+    # for V4-Flash configs whose compress_ratios contain no non-zero entries
+    # (e.g. our 1-layer truncated test), no layer ever consumes it. Returning
+    # None keeps the dataclass populated without importing flash_mla. If a
+    # consumer later needs real metadata on Ampere, route through TileLang
+    # (see fp8_paged_mqa_logits patch in nsa/tilelang_kernel.py).
+    try:
+        import torch as _torch  # local
+        major, _ = _torch.cuda.get_device_capability()
+    except Exception:
+        major = 0
+    if major < 9:
+        return None
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]

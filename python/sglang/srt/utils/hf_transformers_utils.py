@@ -346,6 +346,20 @@ def get_config(
                     revision=revision,
                     **kwargs,
                 )
+            elif "deepseek_v4" in str(e):
+                # The published DeepSeek-V4-Flash checkpoint sets
+                # model_type="deepseek_v4", which transformers doesn't
+                # recognize. Reuse the deepseek_ref reroute (reads the
+                # checkpoint's config.json, rewrites model_type to
+                # deepseek_v3, loads the result via AutoConfig).
+                config = _load_deepseek_temp_model(
+                    model,
+                    model_type="deepseek_ref",
+                    architecture="DeepseekV4ForCausalLM",
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
             else:
                 raise e
 

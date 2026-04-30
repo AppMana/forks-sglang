@@ -35,21 +35,29 @@ namespace device {
 inline constexpr auto kWarpThreads = 32u;
 inline constexpr auto kFullMask = 0xffffffffu;
 
+// PDL (Programmatic Dependent Launch) is sm_90+ only. The asm instructions
+// `griddepcontrol.wait` / `griddepcontrol.launch_dependents` are unsupported
+// on sm<9 and ptxas rejects them at compile time. Gate on __CUDA_ARCH__ so
+// the compiler does not emit them on Ampere/Ada (sm_80 / sm_86 / sm_89).
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
 #ifndef USE_ROCM
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
+#endif
 #endif
 }
 
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
 #ifndef USE_ROCM
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
+#endif
 #endif
 }
 
